@@ -10,6 +10,7 @@
 #include <inttypes.h>        // string to int conversion
 #include <signal.h>          // handling SIGUSR1
 #include <string.h>          // string parsing for --webkit-settings
+#include <getopt.h>          // command-line argument parsing
 
 // Overlay window handle.  Global because almost everything touches it.
 GtkWidget *window;
@@ -34,7 +35,7 @@ static void screen_changed(GtkWidget *widget, GdkScreen *old_screen,
 static void composited_changed(GdkScreen *screen, gpointer user_data);
 static void on_close_web_view(WebKitWebView *web_view, gpointer user_data);
 
-static void size_to_screen(GtkWindow *window);
+static void size_to_screen(GtkWindow *window, bool use_user_geo, GdkRectangle *user_overlay_rect);
 static int get_monitor_rects(GdkDisplay *display, GdkRectangle **rectangles) {
     int n = gdk_display_get_n_monitors(display);
     GdkRectangle *new_rectangles = (GdkRectangle*)malloc(n * sizeof(GdkRectangle));
@@ -46,6 +47,14 @@ static int get_monitor_rects(GdkDisplay *display, GdkRectangle **rectangles) {
     // Ownership of the malloc'd memory transfers out
     return n;
 }
+
+// Original code put the overlay across the whole screen.
+// Let's add a function to allow the user to override that.
+bool use_user_geometry = FALSE;
+cairo_rectangle_int_t user_defined_overlay_rect = {0, 0, 0, 0};
+
+// Emulate !enable_clickthru behavior from ACT's OverlayPlugin
+bool user_requests_clickable = FALSE;
 
 // Stored rectangles out of which we can construct the window's input shape on
 // demand.  The attached inspector's rectangle is stored separately, so when
@@ -61,6 +70,24 @@ void realize_input_shape() {
 
     cairo_region_t *shape = cairo_region_create_rectangle(
             &attached_inspector_input_rect);
+
+    if (user_requests_clickable && use_user_geometry) {
+      // if user wants their whole window clickable, do it!
+      cairo_rectangle_int_t fakerect = {.width=4000, .height=2000, .x=0, .y=0};
+      cairo_region_union_rectangle(shape, &fakerect); // LARHEREFIXME why does this work???
+      if (&user_defined_overlay_rect == NULL) {fprintf(stderr, "wtf"); exit(1);}
+      cairo_region_union_rectangle(shape, &user_defined_overlay_rect);
+      //printf("user clickable %dx%d+%d+%d\n",
+      //       user_defined_overlay_rect.width,
+      //       user_defined_overlay_rect.height,
+      //       user_defined_overlay_rect.x,
+      //       user_defined_overlay_rect.y
+      //       );
+    } else if (user_requests_clickable) {
+      // FIXME: implement this later
+      fprintf(stderr, "unimplemented behavior: no user geometry && clickable\n");
+      exit(1);
+    }
     for (int i = 0; i < user_defined_input_rects->len; ++i) {
         cairo_rectangle_int_t rect = g_array_index(
                     user_defined_input_rects,
@@ -255,6 +282,7 @@ void on_js_call_set_clickable_areas(WebKitUserContentManager *manager,
 
     call_js_callback(web_view, callbackId, "");
 }
+
 void on_js_call_show_inspector(WebKitUserContentManager *manager,
         WebKitJavascriptResult *sentData,
         gpointer arg) {
@@ -377,6 +405,26 @@ void printUsage(char *programName) {
 "\n"
 "\n            http://localhost:4000"
 "\n"
+"\n    --geometry <value>"
+"\n        User-defined geometry of the desired overlay, in the screen coodinate space."
+"\n        Without this value, overlay will be placed over the entire screen (unified across all monitors)."
+"\n        The <value> string is similar to those output by xrandr: WIDTHxHEIGHT+X+Y"
+"\n        EXAMPLE: A overlay with width=1024 by height=768, at"
+"\n                 x-offset 333 and y-offset 77 would be specified as:"
+"\n                 --geometry 1024x768+333+77"
+"\n        NOTE: All four sub-fields of the geometry <value> are required, "
+"\n              i.e. you can't just specify width/height or offsets."
+"\n        WARNING: No sanity-checking is done on geometry dimensions. It's up to"
+"\n              the user to ensure they understand how their monitors map into"
+"\n              the screen coordinate space, and check that their overlay is in"
+"\n              the region displayed by their monitors."
+"\n"
+"\n    --alpha <float>"
+"\n        Sets the transparency of the window. 0.0=fully transparent, 1.0=opaque"
+"\n"
+"\n    --zoom <float>"
+"\n        Sets the zoom level of the window. 1.0=100%, 1.2=120%, etc."
+"\n"
 "\n    --inspect"
 "\n        Open the Web Inspector (dev tools) on start."
 "\n"
@@ -404,8 +452,232 @@ void printUsage(char *programName) {
 "\n    All of the standard GTK debug options and env variables are also"
 "\n    supported.  You probably won't need them, but you can find a list here:"
 "\n    https://developer.gnome.org/gtk3/stable/gtk-running.html"
+"\n"
+"\n    NOTE: The proprietary NVIDIA drivers seem to be having an issue with Webkit."
+"\n          If you run into the error message like so:"
+"\n               \"Failed to create GBM buffer of size *: Invalid argument\","
+"\n          Then change your invocation of %s to:"
+"\n               WEBKIT_DISABLE_DMABUF_RENDERER=1 %s ..."
 "\n",
-        programName);
+programName, programName, programName);
+}
+
+void parse_webkit_settings (WebKitSettings *wk_settings, char *comma_separated_entries) {
+
+  // Fetch all the WebKitSettings object's properties, so we can
+  // check whether the following argument contains keys and values
+  // that exist in it.  It derives from GObject, so we can use GLib's
+  // facilities to operate on its contents generically.
+  //
+  // This insulates us from changes in what settings are supported,
+  // whether due to upstream WebKit developers adding or removing
+  // them, or distros or users building libwebkit in some custom way.
+  guint n_setting_properties;
+  GParamSpec **setting_properties = g_object_class_list_properties(
+                                                                   G_OBJECT_GET_CLASS(wk_settings), &n_setting_properties);
+
+  // `comma_separated_entries` should look something like
+  //
+  //     key1=value1,key2=value2
+  //
+
+  // Separate the entries, and loop over them.
+  //
+  // Note that strtok and strtok_r mutate their input string by
+  // replacing the separator with \0.  We don't care, since we're not
+  // going to use argv[i] anymore once we have pointers to all the
+  // useful strings inside it.
+  //
+  // We need to use the re-entrant version (strtok_r) in the outer
+  // loop, so nothing gets mixed up when the loop body calls the
+  // standard version (strtok) before the loop's strtok has finished
+  // iterating.
+  char *strtok_savepoint;
+  for (char *entry = strtok_r(
+                              comma_separated_entries, ",", &strtok_savepoint);
+       entry != NULL;
+       entry = strtok_r(NULL, ",", &strtok_savepoint)) {
+    // `entry` at this point looks is something like
+    //
+    //     key=value
+    //
+    // or possibly just
+    //
+    //     key
+    //
+
+    // We can cut at the "=" to separate the key and value.  If the
+    // there was no "=", the value ends up NULL.
+    char *key = strtok(entry, "=");
+    char *value = strtok(NULL, "=");
+
+    // If we get the special key "help", print the available WebKit
+    // settings and their value types, and exit.
+    if (!strcmp(key, "help")) {
+      printf("Available values for --webkit-settings (default in parentheses):\n");
+      for (int i = 0; i < n_setting_properties; ++i) {
+        GParamSpec *prop = setting_properties[i];
+        GType type = prop->value_type;
+
+        printf(" • ");
+        printf("%s", prop->name);
+
+        if (g_type_is_a(type, G_TYPE_BOOLEAN)) {
+          bool v;
+          g_object_get(wk_settings, prop->name, &v, NULL);
+          printf(" (%s)", v ? "TRUE" : "FALSE");
+        } else if (g_type_is_a(type, G_TYPE_UINT)) {
+          printf("=<integer>");
+          guint v;
+          g_object_get(wk_settings, prop->name, &v, NULL);
+          printf(" (%d)", v);
+        }
+        else if (g_type_is_a(type, G_TYPE_STRING)) {
+          printf("=<string>");
+          char *v;
+          g_object_get(wk_settings, prop->name, &v, NULL);
+          printf(" ('%s')", v == NULL ? "" : v);
+          g_free(v);
+        } else if (g_type_is_a(type, G_TYPE_ENUM)) {
+          printf("=");
+          GEnumClass *enum_class = (GEnumClass *)
+            g_type_class_ref(type);
+          for (int j = 0; j < enum_class->n_values; ++j) {
+            GEnumValue enum_value = enum_class->values[j];
+            printf("%s", enum_value.value_nick);
+            if (j < enum_class->n_values - 1) printf("|");
+          }
+          gint v;
+          g_object_get(wk_settings, prop->name, &v, NULL);
+          printf(" (%s)",
+                 g_enum_get_value(enum_class, v)->value_nick);
+        } else printf("%s", g_type_name(type));
+
+        if (prop->flags & G_PARAM_DEPRECATED)
+          printf( " [⚠ DEPRECATED]");
+
+        printf("\n");
+      }
+      exit(0);
+    }
+
+    for (int i = 0; i < n_setting_properties; ++i) {
+      GParamSpec *setting_property = setting_properties[i];
+
+      // Skip non-matching entries.
+      if (strcmp(setting_property->name, key)) continue;
+
+      // Parse the option according to what the GObject type of
+      // that settings property is.
+      //
+      // We use GObject metadata stuff to ease maintenance load,
+      // so when upstream WebKit changes things, we don't have to
+      // be updating a big hardcoded list of settings.
+
+      // Boolean settings can be 'key', 'key=TRUE' or 'key=FALSE'
+      if (g_type_is_a(
+                      setting_property->value_type,
+                      G_TYPE_BOOLEAN)) {
+        bool actual_value;
+        if (value == NULL) actual_value = TRUE;
+        else if (!strcmp(value, "TRUE")) actual_value = TRUE;
+        else if (!strcmp(value, "FALSE")) actual_value = FALSE;
+        else {
+          fprintf(stderr,
+                  "Invalid value for %s: %s ", key, value);
+          fprintf(stderr, "(expected TRUE or FALSE)\n");
+          exit(3);
+        }
+        g_object_set(wk_settings,
+                     setting_property->name, actual_value,
+                     NULL);
+        goto next_wk;
+
+        // String settings must be 'key=value', and we can directly
+        // use the value string.
+      } else if (g_type_is_a(setting_property->value_type,
+                             G_TYPE_STRING)) {
+        g_object_set(wk_settings,
+                     setting_property->name, value,
+                     NULL);
+        goto next_wk;
+
+        // Unsigned integer settings must be 'key=value', but we
+        // have to parse the value string into an integer first.
+      } else if (g_type_is_a(setting_property->value_type,
+                             G_TYPE_UINT)) {
+        guint32 actual_value = strtoimax(value, NULL, 10);
+        g_object_set(wk_settings,
+                     setting_property->name, actual_value,
+                     NULL);
+        goto next_wk;
+
+        // Enumeration settings must be 'key=value', but the value
+        // string must be an allowed option for that enum.
+      } else if (g_type_is_a(setting_property->value_type,
+                             G_TYPE_ENUM)) {
+
+        // Convert the GTypeClass of the property to an
+        // GEnumClass, so we can have a look through its
+        // allowed values.
+        GEnumClass *enum_class = (GEnumClass *)
+          g_type_class_ref(setting_property->value_type);
+        bool is_valid = false;
+        for (int j = 0; j < enum_class->n_values; ++j) {
+          GEnumValue enum_value = enum_class->values[j];
+          //printf("Allowed enum value: %s\n", enum_value.value_nick);
+          if (!strcmp(enum_value.value_nick, value)) {
+            is_valid = true;
+            break;
+          }
+        }
+
+        if (is_valid) {
+          gint actual_value =
+            g_enum_get_value_by_nick(enum_class, value)
+            ->value;
+          g_object_set(wk_settings, key, actual_value, NULL);
+
+        } else {
+          fprintf(stderr,
+                  "Invalid WebKit setting '%s=%s'\n",
+                  key, value);
+          fprintf(stderr, "Allowed values for '%s':\n", key);
+          for (int j = 0; j < enum_class->n_values; ++j) {
+            GEnumValue enum_value = enum_class->values[j];
+            printf("- %s\n", enum_value.value_nick);
+          }
+          exit(5);
+        }
+
+        g_type_class_unref(enum_class);
+        goto next_wk;
+
+      } else {
+        fprintf(stderr, "Cannot parse value for setting '%s':\n",
+                setting_property->name);
+        printf("    The setting exists, but we have no parser for its type '%s'.\n",
+               g_type_name(setting_property->value_type));
+
+        exit(4);
+      }
+    }
+
+    fprintf(stderr, "No such webkit setting: %s\n", key);
+    exit(3);
+
+  next_wk:
+    continue;
+  }
+  free(setting_properties);
+}
+
+void parse_geometry(char *optarg) {
+  // Format is similar to xrandr output: "%dx%d+%d+%d", width, height, offx, offy
+  int code = sscanf(optarg, "%dx%d+%d+%d", &user_defined_overlay_rect.width, &user_defined_overlay_rect.height, &user_defined_overlay_rect.x, &user_defined_overlay_rect.y);
+  if (code != 4) {
+    {fprintf(stderr, "Incorrect format in geometry specifier %s",  optarg);  exit(1);}
+  }
 }
 
 int main(int argc, char **argv) {
@@ -425,232 +697,46 @@ int main(int argc, char **argv) {
 
     char *target_url = NULL;
     bool open_inspector_immediately = FALSE;
+    float user_alpha = 0.0;
+    float user_zoom = 1.0;
 
-    for (int i = 1; i < argc; ++i) {
-        // Handle flag arguments
-        if      (!strcmp(argv[i], "--help")) { printUsage(argv[0]); exit(0); }
-        else if (!strcmp(argv[i], "--inspect")) open_inspector_immediately = TRUE;
-        else if (!strcmp(argv[i], "--webkit-settings")) {
+    int getopt_return_code;
+    static struct option long_options [] = {
+      {"help",            no_argument,       NULL, 'h'},
+      {"inspect",         no_argument,       NULL, 'i'},
+      {"webkit-settings", required_argument, NULL, 's'},
+      {"geometry",        required_argument, NULL, 'g'},
+      {"clickable",       no_argument,       NULL, 'c'},
+      {"alpha",           required_argument, NULL, 'a'},
+      {"zoom",            required_argument, NULL, 'z'},
+      {NULL, 0, NULL, 0} // end
+    };
 
-            // Fetch all the WebKitSettings object's properties, so we can
-            // check whether the following argument contains keys and values
-            // that exist in it.  It derives from GObject, so we can use GLib's
-            // facilities to operate on its contents generically.
-            //
-            // This insulates us from changes in what settings are supported,
-            // whether due to upstream WebKit developers adding or removing
-            // them, or distros or users building libwebkit in some custom way.
-            guint n_setting_properties;
-            GParamSpec **setting_properties = g_object_class_list_properties(
-                    G_OBJECT_GET_CLASS(wk_settings), &n_setting_properties);
+    while ((getopt_return_code = getopt_long(argc, argv, "hics:g:a:z:", long_options, NULL)) != -1) {
+      // char* optarg holds the arguments that getopt parsed out
+      switch (getopt_return_code) {
+      case 'h': printUsage(argv[0]); exit(0); break;
+      case 'i': open_inspector_immediately = TRUE; break;
+      case 'c': user_requests_clickable = TRUE; break;
+      case 's': parse_webkit_settings(wk_settings, optarg); break;
+      case 'g': use_user_geometry = TRUE; parse_geometry(optarg); break;
+      case 'a': if (sscanf(optarg, "%f", &user_alpha) != 1) {fprintf(stderr, "Incorrect alpha specifier, %s", optarg); exit(1);} break;
+      case 'z': if (sscanf(optarg, "%f", &user_zoom) != 1) {fprintf(stderr, "Incorrect zoom specifier, %s", optarg); exit(1);} break;
+      default : printUsage(argv[0]); exit(1); break;
+      }
+    }
 
-            ++i;
-            char *comma_separated_entries = argv[i];
-            // `comma_separated_entries` should look something like
-            //
-            //     key1=value1,key2=value2
-            //
-
-            // Separate the entries, and loop over them.
-            //
-            // Note that strtok and strtok_r mutate their input string by
-            // replacing the separator with \0.  We don't care, since we're not
-            // going to use argv[i] anymore once we have pointers to all the
-            // useful strings inside it.
-            //
-            // We need to use the re-entrant version (strtok_r) in the outer
-            // loop, so nothing gets mixed up when the loop body calls the
-            // standard version (strtok) before the loop's strtok has finished
-            // iterating.
-            char *strtok_savepoint;
-            for (char *entry = strtok_r(
-                        comma_separated_entries, ",", &strtok_savepoint);
-                    entry != NULL;
-                    entry = strtok_r(NULL, ",", &strtok_savepoint)) {
-                // `entry` at this point looks is something like
-                //
-                //     key=value
-                //
-                // or possibly just
-                //
-                //     key
-                //
-
-                // We can cut at the "=" to separate the key and value.  If the
-                // there was no "=", the value ends up NULL.
-                char *key = strtok(entry, "=");
-                char *value = strtok(NULL, "=");
-
-                // If we get the special key "help", print the available WebKit
-                // settings and their value types, and exit.
-                if (!strcmp(key, "help")) {
-                    printf("Available values for --webkit-settings (default in parentheses):\n");
-                    for (int i = 0; i < n_setting_properties; ++i) {
-                        GParamSpec *prop = setting_properties[i];
-                        GType type = prop->value_type;
-
-                        printf(" • ");
-                        printf("%s", prop->name);
-
-                        if (g_type_is_a(type, G_TYPE_BOOLEAN)) {
-                            bool v;
-                            g_object_get(wk_settings, prop->name, &v, NULL);
-                            printf(" (%s)", v ? "TRUE" : "FALSE");
-                        } else if (g_type_is_a(type, G_TYPE_UINT)) {
-                            printf("=<integer>");
-                            guint v;
-                            g_object_get(wk_settings, prop->name, &v, NULL);
-                            printf(" (%d)", v);
-                        }
-                        else if (g_type_is_a(type, G_TYPE_STRING)) {
-                            printf("=<string>");
-                            char *v;
-                            g_object_get(wk_settings, prop->name, &v, NULL);
-                            printf(" ('%s')", v == NULL ? "" : v);
-                            g_free(v);
-                        } else if (g_type_is_a(type, G_TYPE_ENUM)) {
-                            printf("=");
-                            GEnumClass *enum_class = (GEnumClass *)
-                                g_type_class_ref(type);
-                            for (int j = 0; j < enum_class->n_values; ++j) {
-                                GEnumValue enum_value = enum_class->values[j];
-                                printf("%s", enum_value.value_nick);
-                                if (j < enum_class->n_values - 1) printf("|");
-                            }
-                            gint v;
-                            g_object_get(wk_settings, prop->name, &v, NULL);
-                            printf(" (%s)",
-                                    g_enum_get_value(enum_class, v)->value_nick);
-                        } else printf("%s", g_type_name(type));
-
-                        if (prop->flags & G_PARAM_DEPRECATED)
-                            printf( " [⚠ DEPRECATED]");
-
-                        printf("\n");
-                    }
-                    exit(0);
-                }
-
-                for (int i = 0; i < n_setting_properties; ++i) {
-                    GParamSpec *setting_property = setting_properties[i];
-
-                    // Skip non-matching entries.
-                    if (strcmp(setting_property->name, key)) continue;
-
-                    // Parse the option according to what the GObject type of
-                    // that settings property is.
-                    //
-                    // We use GObject metadata stuff to ease maintenance load,
-                    // so when upstream WebKit changes things, we don't have to
-                    // be updating a big hardcoded list of settings.
-
-                    // Boolean settings can be 'key', 'key=TRUE' or 'key=FALSE'
-                    if (g_type_is_a(
-                                setting_property->value_type,
-                                G_TYPE_BOOLEAN)) {
-                        bool actual_value;
-                        if (value == NULL) actual_value = TRUE;
-                        else if (!strcmp(value, "TRUE")) actual_value = TRUE;
-                        else if (!strcmp(value, "FALSE")) actual_value = FALSE;
-                        else {
-                            fprintf(stderr,
-                                    "Invalid value for %s: %s ", key, value);
-                            fprintf(stderr, "(expected TRUE or FALSE)\n");
-                            exit(3);
-                        }
-                        g_object_set(wk_settings,
-                                setting_property->name, actual_value,
-                                NULL);
-                        goto next;
-
-                    // String settings must be 'key=value', and we can directly
-                    // use the value string.
-                    } else if (g_type_is_a(setting_property->value_type,
-                                G_TYPE_STRING)) {
-                        g_object_set(wk_settings,
-                                setting_property->name, value,
-                                NULL);
-                        goto next;
-
-                    // Unsigned integer settings must be 'key=value', but we
-                    // have to parse the value string into an integer first.
-                    } else if (g_type_is_a(setting_property->value_type,
-                                G_TYPE_UINT)) {
-                        guint32 actual_value = strtoimax(value, NULL, 10);
-                        g_object_set(wk_settings,
-                                setting_property->name, actual_value,
-                                NULL);
-                        goto next;
-
-                    // Enumeration settings must be 'key=value', but the value
-                    // string must be an allowed option for that enum.
-                    } else if (g_type_is_a(setting_property->value_type,
-                                G_TYPE_ENUM)) {
-
-                        // Convert the GTypeClass of the property to an
-                        // GEnumClass, so we can have a look through its
-                        // allowed values.
-                        GEnumClass *enum_class = (GEnumClass *)
-                            g_type_class_ref(setting_property->value_type);
-                        bool is_valid = false;
-                        for (int j = 0; j < enum_class->n_values; ++j) {
-                            GEnumValue enum_value = enum_class->values[j];
-                            //printf("Allowed enum value: %s\n", enum_value.value_nick);
-                            if (!strcmp(enum_value.value_nick, value)) {
-                                is_valid = true;
-                                break;
-                            }
-                        }
-
-                        if (is_valid) {
-                            gint actual_value =
-                                g_enum_get_value_by_nick(enum_class, value)
-                                ->value;
-                            g_object_set(wk_settings, key, actual_value, NULL);
-
-                        } else {
-                            fprintf(stderr,
-                                    "Invalid WebKit setting '%s=%s'\n",
-                                    key, value);
-                            fprintf(stderr, "Allowed values for '%s':\n", key);
-                            for (int j = 0; j < enum_class->n_values; ++j) {
-                                GEnumValue enum_value = enum_class->values[j];
-                                printf("- %s\n", enum_value.value_nick);
-                            }
-                            exit(5);
-                        }
-
-                        g_type_class_unref(enum_class);
-                        goto next;
-
-                    } else {
-                        fprintf(stderr, "Cannot parse value for setting '%s':\n",
-                                setting_property->name);
-                        printf("    The setting exists, but we have no parser for its type '%s'.\n",
-                                g_type_name(setting_property->value_type));
-
-                        exit(4);
-                    }
-                }
-
-                fprintf(stderr, "No such webkit setting: %s\n", key);
-                exit(3);
-
-next:
-                continue;
-            }
-            free(setting_properties);
-        }
-        else {
-            // Handle positional arguments.  Should be only 1: the target URL.
-            if (!target_url) {
-                target_url = argv[i];
-            } else {
-                fprintf(stderr, "Too many positional arguments!\n\n");
-                printUsage(argv[0]);
-                exit(1);
-            }
-        }
+    // Handle positional arguments.  Should be only 1: the target URL.
+    if (optind == argc-1) { // correct number of positional arguments
+      target_url = argv[optind]; // optind points to where getopt stopped
+    } else if (optind >= argc) {
+      fprintf(stderr, "Too few positional arguments! Where's the URL?\n\n");
+      printUsage(argv[0]);
+      exit(1);
+    } else { // optind < argc-1
+      fprintf(stderr, "Too many positional arguments! Only one URL allowed!\n\n");
+      printUsage(argv[0]);
+      exit(1);
     }
 
     if (target_url == NULL) {
@@ -730,9 +816,12 @@ next:
     };
     sigaction(SIGUSR1, &usr1_action, NULL);
 
-    // Make transparent
-    GdkRGBA rgba = { .alpha = 0.0 };
+    // Make transparent 
+    GdkRGBA rgba = { .alpha = user_alpha };
     webkit_web_view_set_background_color(web_view, &rgba);
+
+    // Zoom if desired
+    webkit_web_view_set_zoom_level(web_view, user_zoom);
     gtk_container_add(GTK_CONTAINER(window), GTK_WIDGET(web_view));
 
     // Load the given URL
@@ -792,7 +881,7 @@ next:
     // visible.  This could cause a few frames of the wrong window position
     // being shown on affected window managers, but should do nothing on window
     // managers that behave properly.
-    size_to_screen(GTK_WINDOW(window));
+    size_to_screen(GTK_WINDOW(window), use_user_geometry, &user_defined_overlay_rect);
 
     //
     // Set up the JavaScript API
@@ -890,7 +979,9 @@ next:
     return 0;
 }
 
-static void size_to_screen(GtkWindow *window) {
+static void size_to_screen(GtkWindow *window, bool use_user_geo, GdkRectangle *user_overlay_rect) {
+  int x = 0, y = 0, width = 0, height = 0;
+  if (!use_user_geo) {
     GdkScreen *screen = gtk_widget_get_screen(GTK_WIDGET(window));
 
     // Get total screen size.  This involves finding all physical monitors
@@ -911,7 +1002,6 @@ static void size_to_screen(GtkWindow *window) {
     // I can't think of a reason why someone's monitor setup might have a
     // monitor positioned origin at negative x, y coordinates, but just in case
     // someone does, we'll cover for it.
-    int x = 0, y = 0, width = 0, height = 0;
     for (int i = 0; i < nRectangles; ++i) {
         GdkRectangle rect = rectangles[i];
         int left = rect.x;
@@ -924,6 +1014,13 @@ static void size_to_screen(GtkWindow *window) {
         if (height < bottom) height = bottom;
     }
     free(rectangles);
+  } else {
+    // FIXME LARHERE: no checking here to make sure the user's geometry inputs are sensible and on-screen. 
+    x      = user_overlay_rect->x;
+    y      = user_overlay_rect->y;
+    width  = user_overlay_rect->width;
+    height = user_overlay_rect->height;
+  }
 
     gtk_window_move(GTK_WINDOW(window), x, y);
     gtk_window_set_default_size(window, width, height);
@@ -976,7 +1073,7 @@ gulong monitors_changed_handler_id = 0;
 
 static void on_monitors_changed(GdkScreen *screen, gpointer user_data) {
     WebKitWebView *web_view = (WebKitWebView *)user_data;
-    size_to_screen(GTK_WINDOW(window));
+    size_to_screen(GTK_WINDOW(window), use_user_geometry, &user_defined_overlay_rect);
     call_js_listeners(web_view, "monitors-changed", "");
 }
 
@@ -1006,7 +1103,7 @@ static void screen_changed(GtkWidget *widget, GdkScreen *old_screen,
     monitors_changed_handler_id = g_signal_connect(screen, "monitors-changed",
             G_CALLBACK(on_monitors_changed), web_view);
 
-    size_to_screen(GTK_WINDOW(widget));
+    size_to_screen(GTK_WINDOW(widget), use_user_geometry, &user_defined_overlay_rect);
 }
 
 // This callback runs when JavaScript on the page calls window.close()
